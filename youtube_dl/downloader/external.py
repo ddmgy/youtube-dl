@@ -230,10 +230,10 @@ class FFmpegFD(ExternalFD):
 
         args = [ffpp.executable, '-y']
 
-        for log_level in ('quiet', 'verbose'):
-            if self.params.get(log_level, False):
-                args += ['-loglevel', log_level]
-                break
+        if self.params.get("quiet", False):
+            args += ['-loglevel', 'quiet']
+        else:
+            args += ['-loglevel', 'info']
 
         seekable = info_dict.get('_seekable')
         if seekable is not None:
@@ -333,18 +333,103 @@ class FFmpegFD(ExternalFD):
 
         self._debug_cmd(args)
 
-        proc = subprocess.Popen(args, stdin=subprocess.PIPE, env=env)
-        try:
-            retval = proc.wait()
-        except KeyboardInterrupt:
-            # subprocces.run would send the SIGKILL signal to ffmpeg and the
-            # mp4 file couldn't be played, but if we ask ffmpeg to quit it
-            # produces a file that is playable (this is mostly useful for live
-            # streams). Note that Windows is not affected and produces playable
-            # files (see https://github.com/ytdl-org/youtube-dl/issues/8300).
-            if sys.platform != 'win32':
-                proc.communicate(b'q')
-            raise
+        def run_ffmpeg(args):
+            def _parse_time_string(ts):
+                parts = []
+                chunk = ""
+                for c in ts:
+                    if c in ('.', ':'):
+                        parts.append(int(chunk))
+                        chunk = ""
+                        continue
+                    chunk += c
+                if chunk:
+                    parts.append(int(chunk))
+                # Convert parts to timestamp in milliseconds
+                total = parts[3]
+                total += parts[2] * 1000
+                total += parts[1] * 60 * 1000
+                total += parts[0] * 60 * 60 * 1000
+                return total
+            start = time.time()
+            proc = subprocess.Popen(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env)
+            cursor_in_new_line = True
+            proc_stderr_closed = False
+            try:
+                duration_re = re.compile(r"\s+Duration:\s+(\d+:\d+:\d+\.\d+)\,.*")
+                total_duration = None
+                while total_duration is None and not proc_stderr_closed:
+                    # read line from stderr
+                    line = ''
+                    while True:
+                        char = proc.stderr.read(1)
+                        if not char:
+                            proc_stderr_closed = True
+                            break
+                        if char in (b'\r', b'\n'):
+                            break
+                        line += char.decode('ascii', 'replace')
+                    if not line:
+                        # proc_stderr_closed is True
+                        continue
+                    mobj = duration_re.match(line)
+                    if mobj:
+                        total_duration = _parse_time_string(mobj.group(1))
+                        break
+                info_re = re.compile(r"size=\s*(\d+)kB\s+time\=\s*(\d+:\d+:\d+\.\d+)")
+                while not proc_stderr_closed:
+                    # read line from stderr
+                    line = ''
+                    while True:
+                        char = proc.stderr.read(1)
+                        if not char:
+                            proc_stderr_closed = True
+                            break
+                        if char in (b'\r', b'\n'):
+                            break
+                        line += char.decode('ascii', 'replace')
+                    if not line:
+                        # proc_stderr_closed is True
+                        continue
+                    mobj = info_re.search(line)
+                    if mobj:
+                        downloaded_data_len = int(float(mobj.group(1)) * 1024)
+                        downloaded_time = _parse_time_string(mobj.group(2))
+                        percent = (downloaded_time / total_duration) * 100
+                        estimated_size = int((downloaded_data_len * 100) / percent)
+                        time_now = time.time()
+                        eta = self.calc_eta(start, time_now, 100, percent)
+                        speed = self.calc_speed(start, time_now, downloaded_data_len)
+                        self._hook_progress({
+                            'status': 'downloading',
+                            'downloaded_bytes': downloaded_data_len,
+                            'total_bytes_estimate': estimated_size,
+                            'tmpfilename': tmpfilename,
+                            'eta': eta,
+                            'speed': speed,
+                            'elapsed': time_now - start,
+                        })
+                        cursor_in_new_line = False
+            except KeyboardInterrupt:
+                # subprocess.run would send the SIGKILL signal to ffmpeg and the
+                # mp4 file couldn't be played, but if we ask ffmpeg to quit it
+                # produces a file that is playable (this is mostly useful for live
+                # streams). Note that Windows is not affected and produces playable
+                # files (see https://github.com/ytdl-org/youtube-dl/issues/8300).
+                if sys.platform != 'win32':
+                    proc.communicate(b'q')
+                raise
+            finally:
+                proc.wait()
+            if not cursor_in_new_line:
+                self.to_screen('')
+            return proc.returncode
+
+        retval = run_ffmpeg(args)
         return retval
 
 
